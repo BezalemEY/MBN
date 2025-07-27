@@ -1,0 +1,713 @@
+library(bnlearn)
+library(igraph)
+library(INLA)
+library(gridExtra)
+library(ggplot2)
+library(lme4)
+library(dplyr)
+library(mvtnorm)
+library(caret)
+library(graphpcor)
+nsims = 100
+## extending MBN using INLA to longitudinal data (correlated random effects $2 \times 2$ covariance matrix)
+## ======Custom score function MLE========##
+fitME = function(node, parents, group, t, data) {
+  
+  # Remove 't' from parents to avoid duplication
+  rhs = paste(c("1", setdiff(parents, t), t), collapse = " + ")  
+  formula = as.formula(paste(node, "~", rhs, "+ (1 +", t, "|", group, ")"))
+  
+  model = try(lmer(formula, data = data, control = lmerControl(calc.derivs = FALSE)))
+  
+  if (is(model, "try-error"))
+    return(NULL)
+  
+  return(model)
+  
+} #FITME
+
+scoreME = function(node, parents, data, args = list()) {
+  
+  if (node == args$group)
+    return(0)
+  if (node == args$t)
+    return(0)
+  
+  # mixed effects models with performance tuning to speed up learning.
+  require(lme4)
+  environment(nloptwrap)$defaultControl$maxeval = 5 * 1e3
+  environment(nloptwrap)$defaultControl$xtol_abs = 1e-6
+  environment(nloptwrap)$defaultControl$ftol_abs = 1e-6
+  
+  local.distribution =
+    fitME(node = node, parents = setdiff(parents, c(args$group, args$t)),  # Ensure t is not duplicated
+          group = args$group, t = args$t, data = data)
+  
+  if (is.null(local.distribution))
+    return(-Inf)
+  
+  return(- BIC(local.distribution))
+  
+} #SCOREME
+
+##=== Custom score function-- INLA default wishart prior ====##
+fitME1 = function(node, parents, group, t, data) {
+  nid <- length(unique(data[[group]]))  
+  data$numid <- as.numeric(as.factor(data[[group]]))  
+  data$slopeid <- data$numid +nid
+  
+  rhs = paste(c("1", setdiff(parents, t), t), collapse = " + ")
+  
+  formula = as.formula(paste0(node, "~", rhs, 
+                              "+ f(numid, model = 'iidkd', n =", 2 * nid, ", order = 2)",
+                              "+ f(slopeid, t, copy = 'numid')"))
+  
+  model = tryCatch(
+    inla(formula, family = "gaussian", data = data,
+         control.inla = list(int.strategy = "eb")),
+    error = function(e) {
+      message("Error fitting model for node ", node, ": ", e$message)
+      return(NULL)
+    }
+  )
+  return(model)
+}
+
+scoreME1 =  function(node, parents, data, args = list()) {
+  
+  if (node == args$group)
+    return(0)
+  if (node == args$t)
+    return(0)
+  
+  require(INLA)
+  
+  local.distribution =
+    fitME1(node = node, parents = setdiff(parents, c(args$group, args$t)),  # Ensure both are removed
+           group = args$group, t = args$t, data = data)
+  
+  if (is.null(local.distribution))
+    return(-Inf)
+  
+  return(local.distribution$mlik[1])
+  
+  
+}
+
+#== score function INLA - user defind wishart prior==#
+fitME2 = function(node, parents, group, t, data) {
+  nid <- length(unique(data[[group]]))  
+  data$numid <- as.numeric(as.factor(data[[group]]))  
+  data$slopeid <- data$numid +nid
+  
+  rhs = paste(c("1", setdiff(parents, t), t), collapse = " + ")
+  
+  formula = as.formula(paste0(
+    node, "~", rhs, 
+    "+ f(numid, model = 'iidkd', order = 2, n = ", 2 * nid, 
+    ", constr = FALSE, hyper = list(theta1 = list(param = c(6,1,1,0))))",
+    "+ f(slopeid, t, copy = 'numid')"
+  ))
+  
+  model = tryCatch(
+    inla(formula, family = "gaussian", data = data,
+         control.inla = list(int.strategy = "eb")),
+    error = function(e) {
+      message("Error fitting model for node ", node, ": ", e$message)
+      return(NULL)
+    }
+  )
+  return(model)
+}
+
+scoreME2 =  function(node, parents, data, args = list()) {
+  
+  if (node == args$group)
+    return(0)
+  if (node == args$t)
+    return(0)
+  
+  require(INLA)
+  
+  local.distribution =
+    fitME2(node = node, parents = setdiff(parents, c(args$group, args$t)),  # Ensure both are removed
+           group = args$group, t = args$t, data = data)
+  
+  if (is.null(local.distribution))
+    return(-Inf)
+  
+  return(local.distribution$mlik[1])
+}
+
+#===== LKJ prior, eta=10, default prior ====#
+fitME3 <- function(node, parents, group, t, data) {
+  data$ID <- as.numeric(data$ID)
+  data$rintercept <- rep(1, each = nrepeat * nindividual)
+  data$rSlope <- rep(2, each = nrepeat * nindividual)
+  n <- 2
+  eta_values <- c(10, 30)  # Try these eta values in order
+  
+  cinla <- list(int.strategy = 'eb')
+  rhs <- paste(c("1", setdiff(parents, t), t), collapse = " + ")
+  
+  for (eta in eta_values) {
+    #message("Trying eta = ", eta, " for node ", node)
+    cmodel <- cgeneric(model = "LKJ", n = n, eta = eta)
+    
+    formula <- as.formula(paste0(node, " ~ ", rhs,
+                                 " + f(rintercept, model = cmodel, replicate = ID)",
+                                 " + f(rSlope, ", t, ", copy = 'rintercept', replicate = ID)"))
+    
+    model <- try(
+      inla(formula, family = "gaussian", data = data,
+           control.mode = list(
+             theta = c(4, 0),
+             restart = TRUE),
+           control.inla = cinla),
+      silent = TRUE
+    )
+    
+    # If the model is not an error object, return it
+    if (!inherits(model, "try-error")) {
+      return(model)
+    } else {
+      #message("INLA crashed with eta = ", eta, ". Trying next eta...")
+    }
+  }
+  
+  warning("All model attempts failed for node ", node)
+  return(NULL)
+}
+
+
+scoreME3 =  function(node, parents, data, args = list()) {
+  
+  if (node == args$group)
+    return(0)
+  if (node == args$t)
+    return(0)
+  
+  require(INLA)
+  
+  local.distribution =
+    fitME3(node = node, parents = setdiff(parents, c(args$group, args$t)),  # Ensure both are removed
+           group = args$group, t = args$t, data = data)
+  
+  if (is.null(local.distribution))
+    return(-Inf)
+  
+  return(local.distribution$mlik[1])
+  
+  
+}
+
+#======= Lkj Prior, user defind prior =======#
+fitME4 <- function(node, parents, group, t, data) {
+  data$ID <- as.numeric(data$ID)
+  data$rintercept <- rep(1, each = nrepeat * nindividual)
+  data$rSlope <- rep(2, each = nrepeat * nindividual)
+  n <- 2
+  eta_values <- c(13, 30)  # Try these eta values in order
+  
+  cinla <- list(int.strategy = 'eb')
+  rhs <- paste(c("1", setdiff(parents, t), t), collapse = " + ")
+  
+  for (eta in eta_values) {
+    #message("Trying eta = ", eta, " for node ", node)
+    cmodel <- cgeneric(model = "LKJ", n = n, eta = eta)
+    
+    formula <- as.formula(paste0(node, " ~ ", rhs,
+                                 " + f(rintercept, model = cmodel, replicate = ID)",
+                                 " + f(rSlope, ", t, ", copy = 'rintercept', replicate = ID)"))
+    
+    model <- try(
+      inla(formula, family = "gaussian", data = data,
+           control.mode = list(
+             theta = c(4, 0),
+             restart = TRUE),
+           control.inla = cinla),
+      silent = TRUE
+    )
+    
+    # If the model is not an error object, return it
+    if (!inherits(model, "try-error")) {
+      return(model)
+    } else {
+     # message("INLA crashed with eta = ", eta, ". Trying next eta...")
+    }
+  }
+  
+  warning("All model attempts failed for node ", node)
+  return(NULL)
+}
+
+
+scoreME4 =  function(node, parents, data, args = list()) {
+  
+  if (node == args$group)
+    return(0)
+  if (node == args$t)
+    return(0)
+  
+  require(INLA)
+  
+  local.distribution =
+    fitME4(node = node, parents = setdiff(parents, c(args$group, args$t)),  # Ensure both are removed
+           group = args$group, t = args$t, data = data)
+  
+  if (is.null(local.distribution))
+    return(-Inf)
+  
+  return(local.distribution$mlik[1])
+  
+  
+}
+
+
+##===  Simulation study for longitudinal data with wishart prior ====##
+
+# Random DAG used to simulate the data
+TMBN = model2network("[ID][t][Y1|ID:t][Y2|ID:t][Y8|ID:t][Y3|Y1:ID:t][Y4|Y1:ID:t][Y5|Y2:ID:t][Y6|Y1:Y5:ID:t][Y9|Y1:Y4:Y8:ID:t][Y7|Y5:Y6:ID:t][Y10|Y4:Y6:t:ID]")
+
+shd_lme <- list()
+shd_inla <-list()
+shd_inla1 <-list()
+shd_inla2 <-list()
+shd_inla3 <-list()
+
+
+for(k in 1:nsims) {
+  nindividual = 30
+  nrepeat = 5
+  N = nrepeat*nindividual
+  
+  data = data.frame(
+    "ID" = rep(1:nindividual, each = nrepeat),
+    "t" = rep(1:nrepeat, nindividual)
+  )
+  #data$t <- data$t - 1
+  #=== Y1|ID:t
+  m= 2
+  rho <- 0.5
+  Sigma <- matrix(NA, m, m)
+  diag(Sigma) <- c(1, 0.7)
+  for(i in 1:m) {
+    for (j in 1:m) {
+      if (i != j) {
+        Sigma[i, j] <- rho^abs(i-j) * sqrt(Sigma[i, i] * Sigma[j, j])
+      }
+    }
+  }
+  random_effects <- rmvnorm(n = nindividual,sigma = Sigma)
+  
+  data$u0 = rep(random_effects[, 1],
+                each = nrepeat, times=1)
+  
+  data$u1 = rep(random_effects[, 2],
+                each = nrepeat, times=1)
+  
+  sigmae1 = sqrt(0.5)
+  data$e = rnorm(N, 0, sigmae1)
+  
+  data$b0 = 1
+  data$b1 = 0.5
+  
+  data$Y1 = data$b0 + data$b1*data$t + data$u1*data$t + data$u0 + data$e
+  
+  
+  data <- data[, !(names(data) %in% c("u0","u1", "e", "b0","b1"))]
+  
+  
+  #== Y2|ID:t
+  m= 2
+  rho <- 0.43
+  Sigma <- matrix(NA, m, m)
+  diag(Sigma) <- c(0.68, 0.52)
+  for(i in 1:m) {
+    for (j in 1:m) {
+      if (i != j) {
+        Sigma[i, j] <- rho^abs(i-j) * sqrt(Sigma[i, i] * Sigma[j, j])
+      }
+    }
+  }
+  random_effects <- rmvnorm(n = nindividual,sigma = Sigma)
+  
+  data$u0 = rep(random_effects[, 1],
+                each = nrepeat, times=1)
+  
+  data$u1 = rep(random_effects[, 2],
+                each = nrepeat, times=1)
+  
+  sigmae1 = sqrt(0.55)
+  data$e = rnorm(N, 0, sigmae1)
+  
+  data$b0 = -1.03
+  data$b1 = 0.5
+  
+  data$Y2 = data$b0 + data$b1*data$t + data$u1*data$t + data$u0 + data$e
+  
+  data <- data[, !(names(data) %in% c("u0","u1", "e", "b0","b1"))]
+  
+  #=== Y3|Y1:ID:t
+  m= 2
+  rho <- -0.5
+  Sigma <- matrix(NA, m, m)
+  diag(Sigma) <- c(0.45, 0.35)
+  for(i in 1:m) {
+    for (j in 1:m) {
+      if (i != j) {
+        Sigma[i, j] <- rho^abs(i-j) * sqrt(Sigma[i, i] * Sigma[j, j])
+      }
+    }
+  }
+  random_effects <- rmvnorm(n = nindividual,sigma = Sigma)
+  
+  data$u0 = rep(random_effects[, 1],
+                each = nrepeat, times=1)
+  
+  data$u1 = rep(random_effects[, 2],
+                each = nrepeat, times=1)
+  
+  sigmae1 = sqrt(0.6)
+  data$e = rnorm(N, 0, sigmae1)
+  
+  data$b0 = 1.3
+  data$b1 = 0.3
+  data$b2 = 0.4
+  
+  data$Y3 = data$b0 + data$b1*data$t +
+    data$b2*data$Y1 + data$u1*data$t + data$u0 + data$e
+  
+  data <- data[, !(names(data) %in% c("u0","u1", "e", "b0","b1", "b2"))]
+  
+  #=== Y4|Y1:ID:t
+  m= 2
+  rho <- 0.4
+  Sigma <- matrix(NA, m, m)
+  diag(Sigma) <- c(0.61, 0.48)
+  for(i in 1:m) {
+    for (j in 1:m) {
+      if (i != j) {
+        Sigma[i, j] <- rho^abs(i-j) * sqrt(Sigma[i, i] * Sigma[j, j])
+      }
+    }
+  }
+  random_effects <- rmvnorm(n = nindividual,sigma = Sigma)
+  
+  data$u0 = rep(random_effects[, 1],
+                each = nrepeat, times=1)
+  
+  data$u1 = rep(random_effects[, 2],
+                each = nrepeat, times=1)
+  
+  sigmae1 = sqrt(0.57) # 0.9
+  data$e = rnorm(N, 0, sigmae1)
+  
+  data$b0 = -0.32
+  data$b1 = 0.56
+  data$b2 = 0.48 #1.02
+  
+  data$Y4 = data$b0 + data$b1*data$t + data$b2*data$Y1 + 
+    data$u1*data$t + data$u0 + data$e
+  
+
+  data <- data[, !(names(data) %in% c("u0","u1", "e", "b0","b1","b0i","b1i", "b2"))]
+  
+  #===Y5|Y2:ID:t
+  m= 2
+  rho <- 0.6 # 0.4
+  Sigma <- matrix(NA, m, m)
+  diag(Sigma) <- c(0.62, 0.50)
+  for(i in 1:m) {
+    for (j in 1:m) {
+      if (i != j) {
+        Sigma[i, j] <- rho^abs(i-j) * sqrt(Sigma[i, i] * Sigma[j, j])
+      }
+    }
+  }
+  random_effects <- rmvnorm(n = nindividual, sigma = Sigma)
+  
+  data$u0 = rep(random_effects[, 1],
+                each = nrepeat, times=1)
+  
+  data$u1 = rep(random_effects[, 2],
+                each = nrepeat, times=1)
+  
+  sigmae1 = sqrt(0.55) #0.95
+  data$e = rnorm(N, 0, sigmae1)
+  
+  data$b0 = 2.63
+  data$b1 = 1.19
+  data$b2 = -0.5
+  
+  data$Y5 = data$b0 + data$b1*data$t + data$b2*data$Y2 + 
+    data$u1*data$t + data$u0 + data$e
+  
+  
+  data <- data[, !(names(data) %in% c("u0","u1", "e", "b0","b1","b2"))]
+  
+  
+  #===Y6|Y1,Y5:t:ID
+  m= 2
+  rho <- 0.48
+  Sigma <- matrix(NA, m, m)
+  diag(Sigma) <- c(0.7, 0.53)
+  for(i in 1:m) {
+    for (j in 1:m) {
+      if (i != j) {
+        Sigma[i, j] <- rho^abs(i-j) * sqrt(Sigma[i, i] * Sigma[j, j])
+      }
+    }
+  }
+  random_effects <- rmvnorm(n = nindividual,sigma = Sigma)
+  
+  data$u0 = rep(random_effects[, 1],
+                each = nrepeat, times=1)
+  
+  data$u1 = rep(random_effects[, 2],
+                each = nrepeat, times=1)
+  
+  
+  
+  sigmae1 = sqrt(0.4) #0.4
+  data$e = rnorm(N, 0, sigmae1)
+  
+  data$b0 = 1.03
+  data$b1 = -0.27
+  data$b2 = 0.77
+  data$b3 = 1.25
+  
+  data$Y6 = data$b0 + data$b1*data$t + data$b2*data$Y1 + 
+    data$b3*data$Y5 + data$u1*data$t + 
+    data$u0 + data$e
+  
+  
+  data <- data[, !(names(data) %in% c("u0","u1", "e", "b0","b1", "b2","b3"))]
+  
+  
+  #===Y7|Y5,Y6:ID:t
+  m= 2
+  rho <- 0.54
+  Sigma <- matrix(NA, m, m)
+  diag(Sigma) <- c(0.75, 0.58)
+  for(i in 1:m) {
+    for (j in 1:m) {
+      if (i != j) {
+        Sigma[i, j] <- rho^abs(i-j) * sqrt(Sigma[i, i] * Sigma[j, j])
+      }
+    }
+  }
+  random_effects <- rmvnorm(n = nindividual, sigma = Sigma)
+  
+  data$u0 = rep(random_effects[, 1],
+                each = nrepeat, times=1)
+  
+  data$u1 = rep(random_effects[, 2],
+                each = nrepeat, times=1)
+  
+  sigmae1 = sqrt(0.57) # 0.87
+  data$e = rnorm(N, 0, sigmae1)
+  
+  data$b0 = 1.28
+  data$b1 = -0.43
+  data$b2 = 0.53
+  data$b3 =  -0.8
+  
+  data$Y7 = data$b0 + data$b1*data$t + data$b2*data$Y5 + 
+    data$b3*data$Y6 + data$u1*data$t + data$u0 + data$e
+  
+  
+  data <- data[, !(names(data) %in% c("u0","u1", "e", "b0","b1","b2","b3"))]
+  
+  
+  #== Y8|ID:t
+  m= 2
+  rho <- 0.38
+  Sigma <- matrix(NA, m, m)
+  diag(Sigma) <- c(0.65, 0.48)
+  for(i in 1:m) {
+    for (j in 1:m) {
+      if (i != j) {
+        Sigma[i, j] <- rho^abs(i-j) * sqrt(Sigma[i, i] * Sigma[j, j])
+      }
+    }
+  }
+  
+  random_effects <- rmvnorm(n = nindividual, sigma = Sigma)
+  
+  data$u0 = rep(random_effects[, 1],
+                each = nrepeat, times=1)
+  
+  data$u1 = rep(random_effects[, 2],
+                each = nrepeat, times=1)
+  
+  sigmae1 = sqrt(0.52) # 0.65
+  data$e = rnorm(N, 0, sigmae1)
+  
+  data$b0 = 1
+  data$b1 = 0.5
+  data$Y8 = data$b0 + data$b1*data$t + data$u1*data$t + data$u0 + data$e
+  
+  data <- data[, !(names(data) %in% c("u0","u1", "e", "b0","b1"))]
+  
+  #===Y9|Y1,Y4,Y8:ID:time
+  m= 2
+  rho <- 0.5
+  Sigma <- matrix(NA, m, m)
+  diag(Sigma) <- c(0.67, 0.56)
+  for(i in 1:m) {
+    for (j in 1:m) {
+      if (i != j) {
+        Sigma[i, j] <- rho^abs(i-j) * sqrt(Sigma[i, i] * Sigma[j, j])
+      }
+    }
+  }
+  random_effects <- rmvnorm(n = nindividual, sigma = Sigma)
+  
+  data$u0 = rep(random_effects[, 1],
+                each = nrepeat, times=1)
+  
+  data$u1 = rep(random_effects[, 2],
+                each = nrepeat, times=1)
+  
+  sigmae1 = sqrt(0.56) # 0.85
+  data$e = rnorm(N, 0, sigmae1)
+  
+  data$b0 = 0.97
+  data$b1 = 0.23
+  data$b2 = 1.31
+  data$b3 = -0.34
+  data$b4 = -0.68
+  
+  data$Y9 = data$b0 +data$b1*data$t + data$b2*data$Y1 +data$b3*data$Y4 +data$b4*data$Y8 + 
+    data$u1*data$t + data$u0 + data$e
+  
+  
+  data <- data[, !(names(data) %in% c("u0","u1", "e", "b0","b1", "b2","b3","b4"))]
+  
+  
+  #===Y10|Y4,Y6:ID:time
+  m= 2
+  rho <- 0.53
+  Sigma <- matrix(NA, m, m)
+  diag(Sigma) <- c(0.56, 0.48)
+  for(i in 1:m) {
+    for (j in 1:m) {
+      if (i != j) {
+        Sigma[i, j] <- rho^abs(i-j) * sqrt(Sigma[i, i] * Sigma[j, j])
+      }
+    }
+  }
+  random_effects <- rmvnorm(n = nindividual, sigma = Sigma)
+  
+  data$u0 = rep(random_effects[, 1],
+                each = nrepeat, times=1)
+  
+  data$u1 = rep(random_effects[, 2],
+                each = nrepeat, times=1)
+  
+  
+  sigmae1 = sqrt(0.55) # 0.75
+  data$e = rnorm(N, 0, sigmae1)
+  
+  data$b0 = 0.34
+  data$b1 = 0.87
+  data$b2 = 1.12
+  data$b3 = 1.82
+  
+  data$Y10 = data$b0 + data$b1*data$t + data$b2*data$Y4 +data$b3*data$Y6 + 
+    data$u1*data$t + data$u0 + data$e
+  
+  
+  data <- data[, !(names(data) %in% c("u0","u1", "e", "b0","b1","b2","b3"))]
+  
+  #== CPT for ID&t
+  CPTID = matrix(rep(1/nindividual, nindividual), ncol = nindividual,
+                 dimnames = list(NULL, as.character(seq(0, nindividual-1))))
+  
+  CPTt = list(
+    coef = c("(Intercept)" = mean(data$t)),
+    sd = sd(data$t))
+  
+  
+  #== True MBN ==#
+  # True DAG
+  TMBN = model2network("[ID][t][Y1|ID:t][Y2|ID:t][Y8|ID:t][Y3|Y1:ID:t][Y4|Y1:ID:t][Y5|Y2:ID:t][Y6|Y1:Y5:ID:t][Y9|Y1:Y4:Y8:ID:t][Y7|Y5:Y6:ID:t][Y10|Y4:Y6:t:ID]")
+  
+  #== Structure learning ==#
+  data$ID<- as.factor(data$ID)
+  data$t<- as.numeric(data$t)
+  
+  all_nodes <- names(data)
+  
+  whitelist.arcs <- data.frame(
+    from = rep(c("ID", "t"), each = length(setdiff(all_nodes, c("ID", "t")))),
+    to = rep(setdiff(all_nodes, c("ID", "t")), 2)
+  )
+  
+  blacklist.arcs <- data.frame(
+    from = rep(setdiff(all_nodes, c("ID", "t")), 2),
+    to = rep(c("ID", "t"), each = length(setdiff(all_nodes, c("ID", "t"))))
+  )
+  
+  
+  
+  dag.lme <- hc(data, score = "custom-score", fun = scoreME, 
+                args = list(group = "ID", t= "t"), 
+                whitelist = whitelist.arcs, 
+                blacklist = blacklist.arcs)
+  
+  dag.inla <- hc(data, score = "custom-score", fun = scoreME1, 
+                 args = list(group = "ID", t= "t"), 
+                 whitelist = whitelist.arcs, 
+                 blacklist = blacklist.arcs)
+  
+  dag.inla1 <- hc(data, score = "custom-score", fun = scoreME2, 
+                 args = list(group = "ID", t= "t"), 
+                 whitelist = whitelist.arcs, 
+                 blacklist = blacklist.arcs)
+  
+  dag.inla2 <- hc(data, score = "custom-score", fun = scoreME3, 
+                  args = list(group = "ID", t= "t"), 
+                  whitelist = whitelist.arcs, 
+                  blacklist = blacklist.arcs)
+  
+  dag.inla3 <- hc(data, score = "custom-score", fun = scoreME4, 
+                  args = list(group = "ID", t= "t"), 
+                  whitelist = whitelist.arcs, 
+                  blacklist = blacklist.arcs)
+  
+  TMBN_cp <- cpdag(TMBN)
+  dag.lme_cp  <- cpdag(dag.lme)
+  dag.inla_cp <- cpdag(dag.inla)
+  dag.inla1_cp <- cpdag(dag.inla1)
+  dag.inla2_cp <- cpdag(dag.inla2)
+  dag.inla3_cp <- cpdag(dag.inla3)
+  #==== Structure comparison with the TRUE DAG====#
+  shd_lme[[k]] = shd(TMBN_cp, dag.lme_cp) 
+  shd_inla[[k]] = shd(TMBN_cp, dag.inla_cp)
+  shd_inla1[[k]] = shd(TMBN_cp, dag.inla1_cp) 
+  shd_inla2[[k]] = shd(TMBN_cp, dag.inla2_cp)
+  shd_inla3[[k]] = shd(TMBN_cp, dag.inla3_cp)
+  
+}
+
+shd_lme<- unlist(shd_lme)
+shd_inla<- unlist(shd_inla)
+shd_inla1<- unlist(shd_inla1)
+shd_inla2<- unlist(shd_inla2)
+shd_inla3<- unlist(shd_inla3)
+
+
+stats<-data.frame(shd_lme, shd_inla, shd_inla1, shd_inla2,  shd_inla3)
+
+setwd("path")
+out.file2 <- sprintf(
+  "Gauss_Long_%s_%s.rds",
+  Sys.Date(), format(Sys.time(), "%H%M%S")
+)
+saveRDS(stats, file = out.file2)
+
+
+
+
